@@ -588,11 +588,13 @@ impl State {
 
                     for session in cursor_sessions_for_output(&shell, &output) {
                         if let Some((geometry, offset)) = seat.cursor_geometry(
-                            position.as_logical().to_buffer(
-                                output.current_scale().fractional_scale(),
-                                output.current_transform(),
-                                &output_geometry.size.to_f64().as_logical(),
-                            ),
+                            (position - output_geometry.loc.to_f64())
+                                .as_logical()
+                                .to_buffer(
+                                    output.current_scale().fractional_scale(),
+                                    output.current_transform(),
+                                    &output_geometry.size.to_f64().as_logical(),
+                                ),
                             self.common.clock.now(),
                         ) {
                             if session
@@ -623,11 +625,11 @@ impl State {
                 if let Some(seat) = maybe_seat {
                     self.common.idle_notifier_state.notify_activity(&seat);
                     let output = seat.active_output();
-                    let geometry = output.geometry();
-                    let position = geometry.loc.to_f64()
+                    let output_geometry = output.geometry();
+                    let position = output_geometry.loc.to_f64()
                         + smithay::backend::input::AbsolutePositionEvent::position_transformed(
                             &event,
-                            geometry.size.as_logical(),
+                            output_geometry.size.as_logical(),
                         )
                         .as_global();
                     let serial = SERIAL_COUNTER.next_serial();
@@ -649,11 +651,13 @@ impl State {
                     let shell = self.common.shell.read();
                     for session in cursor_sessions_for_output(&shell, &output) {
                         if let Some((geometry, offset)) = seat.cursor_geometry(
-                            position.as_logical().to_buffer(
-                                output.current_scale().fractional_scale(),
-                                output.current_transform(),
-                                &geometry.size.to_f64().as_logical(),
-                            ),
+                            (position - output_geometry.loc.to_f64())
+                                .as_logical()
+                                .to_buffer(
+                                    output.current_scale().fractional_scale(),
+                                    output.current_transform(),
+                                    &output_geometry.size.to_f64().as_logical(),
+                                ),
                             self.common.clock.now(),
                         ) {
                             if session
