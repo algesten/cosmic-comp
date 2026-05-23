@@ -17,6 +17,6 @@ tracing = { version = "0.1.44", features = [
 
 [features]
 default = []
-custom-accel = ["input/libinput_1_30"]
+custom-accel = ["input/libinput_1_23"]
 output = ["ron", "tracing"]
 randr = ["cosmic-randr-shell", "output"]
