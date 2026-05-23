@@ -836,7 +836,13 @@ impl Decorations<CosmicWindowInternal, Message> for DefaultDecorations {
             .title(win.last_title.lock().unwrap().clone())
             .on_drag(Message::DragStart)
             .on_close(Message::Close)
-            .focused(win.window.is_activated(false))
+            // Pending state, not committed. The header is a cached iced
+            // element, only re-rendered when the pending activation flips
+            // (see `CosmicWindow::set_activate`, which calls `force_update`).
+            // Committed lags until the client acks the configure, and nothing
+            // re-renders the header then, so reading it here sticks the title
+            // bar on the old focus style.
+            .focused(win.window.is_activated(true))
             .on_double_click(Message::Maximize)
             .on_right_click(Message::Menu)
             .is_ssd(true)
@@ -885,11 +891,17 @@ impl SpaceElement for CosmicWindow {
             .with_program(|p| p.activated.load(Ordering::SeqCst) != activated)
         {
             SpaceElement::set_activate(&self.0, activated);
-            self.0.force_redraw();
             self.0.with_program(|p| {
                 p.activated.store(activated, Ordering::SeqCst);
                 SpaceElement::set_activate(&p.window, activated);
             });
+            // Pending activation is set above. `force_redraw` on its own
+            // only drops the cached primitives, it doesn't re-run `view()`,
+            // so the header would keep its old `focused` state. `force_update`
+            // re-runs `view()` (now reading pending), then `force_redraw`
+            // rasterizes the result.
+            self.0.force_update();
+            self.0.force_redraw();
         }
     }
     #[profiling::function]

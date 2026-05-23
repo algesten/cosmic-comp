@@ -1298,7 +1298,13 @@ impl Decorations<CosmicStackInternal, Message> for DefaultDecorations {
                         .on_close(Message::Close(i))
                     }),
                     active,
-                    windows[active].is_activated(false),
+                    // Pending state, not committed. Same reason as in
+                    // window.rs. The tab header is a cached iced element, only
+                    // re-rendered when the pending activation flips (see
+                    // `CosmicStack::set_activate`, which calls `force_update`).
+                    // Committed lags the client ack and never re-renders the
+                    // header, so it'd stick on the old focus style.
+                    windows[active].is_activated(true),
                     group_focused,
                 )
                 .id(SCROLLABLE_ID.clone())
@@ -1410,6 +1416,10 @@ impl SpaceElement for CosmicStack {
         });
 
         if changed {
+            // `force_update` re-runs `view()` so the header picks up the new
+            // (pending) activation, then `force_redraw` rasterizes it.
+            // `force_redraw` alone doesn't re-run `view()`.
+            self.0.force_update();
             self.0.force_redraw();
         }
     }
