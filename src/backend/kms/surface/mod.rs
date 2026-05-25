@@ -1098,7 +1098,7 @@ impl SurfaceThreadState {
 
         let mut pre_postprocess_data = PrePostprocessData::default();
 
-        let res = if let Some(source_output) = source_output {
+        let clear_color = if let Some(source_output) = source_output {
             let offscreen_output_config =
                 PostprocessOutputConfig::for_output_untransformed(source_output);
             let postprocess_state = match self.postprocess_textures.entry(self.target_node) {
@@ -1272,30 +1272,20 @@ impl SurfaceThreadState {
                 &self.screen_filter,
             );
 
-            if let Err(err) = compositor.with_compositor(|c| c.use_vrr(vrr)) {
-                warn!("Unable to set adaptive VRR state: {}", err);
-            }
-            compositor.render_frame(
-                &mut renderer,
-                &elements,
-                [0.0, 0.0, 0.0, 0.0],
-                self.frame_flags
-                    .union(additional_frame_flags)
-                    .difference(remove_frame_flags),
-            )
+            smithay::backend::renderer::Color32F::new(0.0, 0.0, 0.0, 0.0)
         } else {
-            if let Err(err) = compositor.with_compositor(|c| c.use_vrr(vrr)) {
-                warn!("Unable to set adaptive VRR state: {}", err);
-            }
-            compositor.render_frame(
-                &mut renderer,
-                &elements,
-                CLEAR_COLOR, // TODO use a theme neutral color
-                self.frame_flags
-                    .union(additional_frame_flags)
-                    .difference(remove_frame_flags),
-            )
+            CLEAR_COLOR
         };
+
+        if let Err(err) = compositor.with_compositor(|c| c.use_vrr(vrr)) {
+            warn!("Unable to set adaptive VRR state: {}", err);
+        }
+        let frame_flags = self
+            .frame_flags
+            .union(additional_frame_flags)
+            .difference(remove_frame_flags);
+
+        let res = compositor.render_frame(&mut renderer, &elements, clear_color, frame_flags);
         self.timings.draw_done(&self.clock);
 
         match res {
