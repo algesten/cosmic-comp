@@ -103,7 +103,11 @@ use std::{
 mod timings;
 pub use self::timings::Timings;
 
-use super::{drm_helpers, render::gles::GbmGlowBackend};
+use super::{
+    drm_helpers,
+    render::gles::GbmGlowBackend,
+    tile::TileSlot,
+};
 
 #[cfg(feature = "debug")]
 use smithay_egui::EguiState;
@@ -113,6 +117,12 @@ pub struct Surface {
     pub(crate) connector: connector::Handle,
     pub(super) crtc: crtc::Handle,
     pub(crate) output: Output,
+    /// Set on the single surface backing a merged tile group built via
+    /// `DrmOutputManager::initialize_tiled_output`: the per-CRTC placements for
+    /// the whole group (primary first). The surface itself renders the merged
+    /// output like an ordinary one; smithay's `new_tiled` compositor does the
+    /// slicing across these CRTCs. See [`crate::backend::kms::tile::TileSlot`].
+    pub(crate) tile_group: Option<Vec<TileSlot>>,
     known_nodes: HashSet<DrmNode>,
 
     active: Arc<AtomicBool>,
@@ -144,9 +154,24 @@ pub struct SurfaceThreadState {
     thread_sender: Sender<SurfaceCommand>,
 
     output: Output,
+    /// The per-CRTC placements when this is the single surface backing a
+    /// `new_tiled` merged group (mirrors [`Surface::tile_group`]); `None` for an
+    /// ordinary surface. The thread only checks `.is_some()` — smithay's
+    /// `new_tiled` compositor owns the slicing — to know its `frame_result`
+    /// carries just one tile, so screencopy must render the full logical scene
+    /// separately. Kept as the placements (not a bool) so the one fact has a
+    /// single representation shared with `Surface`.
+    tile_group: Option<Vec<TileSlot>>,
     mirroring: Option<Output>,
     screen_filter: ScreenFilter,
     postprocess_textures: HashMap<DrmNode, PostprocessState>,
+    /// Full-resolution offscreen postprocess state used only by the primary
+    /// surface of a tile-merged Output, populated lazily when a screencopy
+    /// frame is pending. The per-CRTC framebuffer is only one tile wide, so
+    /// blitting it to a 5120-wide screencopy destination would leave the
+    /// other tile's region undefined; this offscreen render produces the
+    /// full logical-size image that screencopy actually wants.
+    screencopy_postprocess: Option<PostprocessState>,
 
     shell: Arc<parking_lot::RwLock<Shell>>,
 
@@ -242,6 +267,7 @@ impl Surface {
         output: &Output,
         crtc: crtc::Handle,
         connector: connector::Handle,
+        tile_group: Option<Vec<TileSlot>>,
         primary_node: Arc<RwLock<Option<DrmNode>>>,
         dev_node: DrmNode,
         target_node: DrmNode,
@@ -256,12 +282,15 @@ impl Surface {
 
         let active_clone = active.clone();
         let output_clone = output.clone();
+        let thread_tile_group = tile_group.clone();
 
+        let thread_name = format!("surface-{}", output.name());
         let thread = std::thread::Builder::new()
-            .name(format!("surface-{}", output.name()))
+            .name(thread_name)
             .spawn(move || {
                 if let Err(err) = surface_thread(
                     output_clone,
+                    thread_tile_group,
                     primary_node,
                     target_node,
                     shell,
@@ -337,6 +366,7 @@ impl Surface {
             connector,
             crtc,
             output: output.clone(),
+            tile_group,
             known_nodes: HashSet::new(),
             active,
             feedback: HashMap::new(),
@@ -491,6 +521,7 @@ impl Drop for Surface {
 
 fn surface_thread(
     output: Output,
+    tile_group: Option<Vec<TileSlot>>,
     primary_node: Arc<RwLock<Option<DrmNode>>>,
     target_node: DrmNode,
     shell: Arc<parking_lot::RwLock<Shell>>,
@@ -543,9 +574,11 @@ fn surface_thread(
         thread_sender,
 
         output,
+        tile_group,
         mirroring: None,
         screen_filter,
         postprocess_textures: HashMap::new(),
+        screencopy_postprocess: None,
 
         shell,
         loop_handle: event_loop.handle(),
@@ -1077,13 +1110,26 @@ impl SurfaceThreadState {
         self.timings.elements_done(&self.clock);
 
         // we can't use the elements after `compositor.render_frame`,
-        // so let's collect everything we need for screencopy now
+        // so let's collect everything we need for screencopy now.
         let mut has_cursor_mode_none = false;
         let frames = if self.mirroring.is_none() {
             take_screencopy_frames(&self.output, &elements, &mut has_cursor_mode_none)
         } else {
             Default::default()
         };
+
+        // Precompute cursor element IDs while we have the typed
+        // `&[CosmicElement<…>]`. `render_frame` below borrows `elements` for
+        // the lifetime of its result, so `send_screencopy_result` takes these
+        // ids (rather than the elements) to filter the cursor out for sessions
+        // that requested none.
+        let screencopy_cursor_ids: Vec<_> = elements
+            .iter()
+            .filter_map(|elem| match elem {
+                CosmicElement::Cursor(_) => Some(elem.id().clone()),
+                _ => None,
+            })
+            .collect();
 
         // actual rendering
         let source_output = self
@@ -1097,6 +1143,27 @@ impl SurfaceThreadState {
             });
 
         let mut pre_postprocess_data = PrePostprocessData::default();
+
+        // Tile-merged Outputs need a full-resolution screencopy capture: each
+        // per-CRTC framebuffer holds only one tile, so this surface's own
+        // `frame_result` can't fill a logical-size screencopy buffer (the other
+        // tile's region would stay black). Render that capture here and stash it
+        // for `send_screencopy_result` to blit instead of `frame_result`.
+        if self.tile_group.is_some() && !frames.is_empty() && self.mirroring.is_none() {
+            match render_screencopy_offscreen(
+                &mut self.screencopy_postprocess,
+                &self.output,
+                &mut renderer,
+                compositor,
+                &elements,
+            ) {
+                Ok(texture) => pre_postprocess_data.texture = Some(texture),
+                Err(err) => {
+                    warn!(?err, "Failed full-resolution screencopy render");
+                    pre_postprocess_data.texture = None;
+                }
+            }
+        }
 
         let clear_color = if let Some(source_output) = source_output {
             let offscreen_output_config =
@@ -1341,7 +1408,7 @@ impl SurfaceThreadState {
                                 &mut pre_postprocess_data,
                                 &tx,
                                 &frame_result,
-                                &elements,
+                                &screencopy_cursor_ids,
                                 (&session, frame, res),
                                 now.into(),
                             ) {
@@ -1650,13 +1717,82 @@ fn take_screencopy_frames(
         .collect()
 }
 
+/// Render the full logical scene of a tile-merged Output into an offscreen
+/// texture for screencopy.
+///
+/// Each member CRTC's framebuffer holds only its own tile, so the merged
+/// surface's `frame_result` can't satisfy a logical-size screencopy buffer.
+/// This renders that full image into a logical-sized texture (reusing
+/// `screencopy_postprocess`, reallocated only when the logical config changes)
+/// and returns it for `send_screencopy_result` to blit.
+fn render_screencopy_offscreen<'a>(
+    screencopy_postprocess: &mut Option<PostprocessState>,
+    output: &Output,
+    renderer: &mut GlMultiRenderer<'a>,
+    compositor: &GbmDrmOutput,
+    elements: &[CosmicElement<GlMultiRenderer<'a>>],
+) -> Result<GlesTexture> {
+    let logical_config = PostprocessOutputConfig::for_output_untransformed(output);
+    let need_new = match screencopy_postprocess.as_ref() {
+        None => true,
+        Some(state) => state.output_config != logical_config,
+    };
+    if need_new {
+        *screencopy_postprocess = Some(PostprocessState::new_with_renderer(
+            renderer,
+            compositor.format(),
+            logical_config,
+        )?);
+    }
+    let postprocess_state = screencopy_postprocess.as_mut().unwrap();
+
+    let mut texture = None;
+    postprocess_state
+        .texture
+        .render()
+        .draw::<_, <GlMultiRenderer as RendererSuper>::Error>(|tex| {
+            texture = Some(tex.clone());
+            let area = tex.size().to_logical(1, Transform::Normal);
+            let mut fb = renderer.bind(tex)?;
+            let res = match postprocess_state.damage_tracker.render_output(
+                renderer,
+                &mut fb,
+                1,
+                elements,
+                CLEAR_COLOR,
+            ) {
+                Ok(res) => res,
+                Err(RenderError::Rendering(err)) => return Err(err),
+                // The damage tracker was just created with a mode above.
+                Err(RenderError::OutputNoMode(_)) => unreachable!("offscreen output has a mode"),
+            };
+            renderer.wait(&res.sync)?;
+            std::mem::drop(fb);
+            let damage = res
+                .damage
+                .map(|rects| {
+                    rects
+                        .iter()
+                        .map(|r| r.to_logical(1).to_buffer(1, Transform::Normal, &area))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            Ok(damage)
+        })?;
+
+    Ok(texture.expect("draw sets the texture before returning Ok"))
+}
+
+/// Cursor-element IDs are computed by the caller (which has the typed
+/// `&[CosmicElement<…>]`) and passed in instead of the elements vec, because
+/// `frame_result` does not carry them in a recoverable form.
 fn send_screencopy_result<'a>(
     renderer: &mut GlMultiRenderer<'a>,
     output: &Output,
     pre_postprocess_data: &mut PrePostprocessData,
     tx: &std::sync::mpsc::Sender<PendingImageCopyData>,
     frame_result: &RenderFrameResult<GbmBuffer, GbmFramebuffer, CosmicElement<GlMultiRenderer<'a>>>,
-    elements: &[CosmicElement<GlMultiRenderer>],
+    cursor_ids: &[smithay::backend::renderer::element::Id],
     (session, frame, res): (
         &ScreencopySessionRef,
         ScreencopyFrame,
@@ -1716,15 +1852,7 @@ fn send_screencopy_result<'a>(
         );
 
         let filter = (!session.draw_cursor())
-            .then(|| {
-                elements.iter().filter_map(|elem| {
-                    if let CosmicElement::Cursor(_) = elem {
-                        Some(elem.id().clone())
-                    } else {
-                        None
-                    }
-                })
-            })
+            .then(|| cursor_ids.iter().cloned())
             .into_iter()
             .flatten();
 

@@ -16,7 +16,10 @@ use render::gles::GbmGlowBackend;
 use smithay::{
     backend::{
         allocator::{Buffer, dmabuf::Dmabuf, format::FormatSet},
-        drm::{DrmDeviceFd, DrmNode, NodeType, VrrSupport, output::DrmOutputRenderElements},
+        drm::{
+            DrmDevice, DrmDeviceFd, DrmNode, NodeType, VrrSupport,
+            output::{DrmOutputRenderElements, DrmTilePlacement},
+        },
         egl::{EGLContext, EGLDevice, EGLDisplay},
         input::InputEvent,
         libinput::{LibinputInputBackend, LibinputSessionInterface},
@@ -55,7 +58,10 @@ mod drm_helpers;
 pub mod render;
 mod socket;
 mod surface;
+mod tile;
+
 use device::*;
+use tile::TileSlot;
 pub(crate) use surface::Surface;
 pub use surface::Timings;
 
@@ -903,13 +909,31 @@ impl KmsGuard<'_> {
                 let drm = &mut device.drm;
                 let conn = surface.connector;
                 let conn_info = drm.device().get_connector(conn, false)?;
+                // The per-surface `mode` below drives `initialize_output`'s
+                // single CRTC. For a merged tile group the connector advertises
+                // only per-tile modes (e.g. 2560×2880), while the Output records
+                // the logical size (5120×2880); match the primary tile's size so
+                // a valid mode is found. (The group actually inits via
+                // `initialize_tiled_output`, which derives each CRTC's mode
+                // itself, so this `mode` is unused there, but it must still
+                // resolve.)
+                let target_mode_size = if let Some(slots) = surface.tile_group.as_ref() {
+                    slots
+                        .iter()
+                        .find(|slot| slot.primary)
+                        .or_else(|| slots.first())
+                        .map(|slot| slot.region.size)
+                        .unwrap_or_else(|| output_config.mode_size())
+                } else {
+                    output_config.mode_size()
+                };
                 let mode = conn_info
                     .modes()
                     .iter()
                     // match the size
                     .filter(|mode| {
                         let (x, y) = mode.size();
-                        Size::from((x as i32, y as i32)) == output_config.mode_size()
+                        Size::from((x as i32, y as i32)) == target_mode_size
                     })
                     // and then select the closest refresh rate (e.g. to match 59.98 as 60)
                     .min_by_key(|mode| {
@@ -971,17 +995,34 @@ impl KmsGuard<'_> {
                                 elements.add_output(crtc, CLEAR_COLOR, output_elements);
                             }
 
-                            let compositor = drm
-                                .initialize_output(
+                            let mode_source: smithay::output::OutputModeSource =
+                                (&surface.output).into();
+                            let compositor = if let Some(slots) = surface.tile_group.clone() {
+                                // Merged tile group: one frame-locked compositor
+                                // drives every member CRTC, each scanning out its
+                                // sub-rect of the logical Output. smithay's
+                                // `new_tiled` does the per-tile slicing, so the
+                                // mode source is the whole logical Output.
+                                let placements = tile_placements(drm.device(), &slots)?;
+                                drm.initialize_tiled_output(
+                                    placements,
+                                    mode_source,
+                                    &mut renderer,
+                                    &elements,
+                                )
+                                .with_context(|| "Failed to create tiled drm surface")?
+                            } else {
+                                drm.initialize_output(
                                     *crtc,
                                     *mode,
                                     &[conn],
-                                    &surface.output,
+                                    mode_source,
                                     Some(planes.clone()),
                                     &mut renderer,
                                     &elements,
                                 )
-                                .with_context(|| "Failed to create drm surface")?;
+                                .with_context(|| "Failed to create drm surface")?
+                            };
 
                             let _ = renderer;
 
@@ -1159,4 +1200,40 @@ impl KmsGuard<'_> {
 
         Ok(())
     }
+}
+
+/// Per-CRTC [`DrmTilePlacement`]s for a merged tile group, ready for
+/// [`smithay::backend::drm::output::DrmOutputManager::initialize_tiled_output`].
+///
+/// Each member CRTC scans out its tile-sized sub-rect of the logical Output; we
+/// pick that connector's highest-refresh mode at the tile size. The group is
+/// frame-locked at the panel's native rate, which is exactly how the merged
+/// Output's mode was derived in `create_merged_output_for_tile`.
+fn tile_placements(device: &DrmDevice, slots: &[TileSlot]) -> Result<Vec<DrmTilePlacement>> {
+    slots
+        .iter()
+        .map(|slot| {
+            let conn_info = device.get_connector(slot.connector, false)?;
+            let mode = conn_info
+                .modes()
+                .iter()
+                .filter(|m| {
+                    let (x, y) = m.size();
+                    Size::from((x as i32, y as i32)) == slot.region.size
+                })
+                .max_by_key(|m| drm_helpers::calculate_refresh_rate(**m))
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("No tile-sized mode for tile crtc {:?}", slot.crtc))?;
+            let planes = device
+                .planes(&slot.crtc)
+                .with_context(|| "Failed to enumerate tile planes")?;
+            Ok(DrmTilePlacement {
+                crtc: slot.crtc,
+                mode,
+                connectors: vec![slot.connector],
+                planes: Some(planes),
+                region: slot.region,
+            })
+        })
+        .collect()
 }

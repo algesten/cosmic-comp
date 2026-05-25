@@ -21,7 +21,7 @@ use smithay::{
             gbm::{GbmAllocator, GbmDevice},
         },
         drm::{
-            DrmDevice, DrmDeviceFd, DrmEvent, DrmNode, NodeType,
+            DrmDevice, DrmDeviceFd, DrmEvent, DrmNode, NodeType, TileInfo,
             compositor::{FrameError, FrameFlags},
             exporter::gbm::GbmFramebufferExporter,
             output::{DrmOutputManager, LockedDrmOutputManager},
@@ -59,7 +59,7 @@ use std::{
     time::Duration,
 };
 
-use super::{drm_helpers, socket::Socket, surface::Surface};
+use super::{drm_helpers, socket::Socket, surface::Surface, tile::TileSlot};
 
 #[derive(Debug)]
 pub struct EGLInternals {
@@ -130,6 +130,17 @@ pub struct InnerDevice {
 
     pub outputs: HashMap<connector::Handle, Output>,
     pub surfaces: HashMap<crtc::Handle, Surface>,
+    /// Merged logical [`Output`]s keyed by [`smithay::backend::drm::TileInfo::group_id`].
+    /// When a connector belongs to a tile group with merge enabled, its
+    /// [`Surface`] is bound to the entry here instead of a fresh per-connector
+    /// `Output`. Empty when no merged tile groups are live on this device.
+    pub tile_outputs: HashMap<u32, Output>,
+    /// Tile-group members gathered as their connectors are enumerated, keyed by
+    /// `group_id`. A merged group is driven by a single [`Surface`] built via
+    /// `initialize_tiled_output`, which needs every member CRTC at once; entries
+    /// accumulate here until the group is complete, then are drained to build
+    /// that surface. See [`crate::backend::kms::tile::TileSlot`].
+    pub tile_pending: HashMap<u32, Vec<TileSlot>>,
     pub gbm: GbmDevice<DrmDeviceFd>,
 
     pub leased_connectors: Vec<(connector::Handle, crtc::Handle)>,
@@ -475,7 +486,26 @@ impl State {
 
             {
                 for (conn, maybe_crtc) in connectors {
-                    if let Some(output) = old_state.outputs.remove(&conn) {
+                    let old_output = old_state.outputs.remove(&conn);
+                    let tile_info = new_device.drm.device().tile_info(conn).ok().flatten();
+
+                    // A tiled connector must take the tile-aware path below so
+                    // its group is regrouped into one frame-locked surface,
+                    // rather than rebuilt as separate halves. Carry the
+                    // previously merged Output into the new device's
+                    // `tile_outputs` (once per group) so `connector_added`
+                    // reuses it instead of building a fresh one, preserving the
+                    // logical Output and its config.
+                    if let Some(info) = tile_info.as_ref() {
+                        if let Some(old_merged) = old_output {
+                            new_device
+                                .inner
+                                .tile_outputs
+                                .entry(info.group_id)
+                                .or_insert(old_merged);
+                        }
+                    } else if let Some(output) = old_output {
+                        // Non-tiled connector with a previous Output: restore it.
                         let has_surface = if old_state.leased_connectors.contains(&conn) {
                             if let Some(crtc) = maybe_crtc {
                                 new_device.inner.leased_connectors.push((conn, crtc));
@@ -515,6 +545,7 @@ impl State {
                                     &output,
                                     crtc,
                                     conn,
+                                    None,
                                     backend.primary_node.clone(),
                                     new_device.inner.dev_node,
                                     new_device.inner.render_node,
@@ -546,29 +577,33 @@ impl State {
                                 .enabled = OutputState::Disabled;
                         }
                         new_device.inner.outputs.insert(conn, output);
-                    } else {
-                        match new_device.inner.connector_added(
-                            new_device.drm.device_mut(),
-                            backend.primary_node.clone(),
-                            conn,
-                            maybe_crtc,
-                            (w, 0),
-                            &self.common.event_loop_handle,
-                            self.common.config.dynamic_conf.screen_filter().clone(),
-                            self.common.shell.clone(),
-                            self.common.startup_done.clone(),
-                        ) {
-                            Ok((output, should_expose)) => {
-                                if should_expose {
-                                    w += output.geometry().size.w as u32;
-                                    outputs_added.push(output.clone());
-                                }
+                        continue;
+                    }
 
-                                new_device.inner.outputs.insert(conn, output);
+                    // Tile-aware path: fresh non-tiled connectors and every
+                    // tiled connector (reusing the merged Output carried over
+                    // above when this is a reconnect).
+                    match new_device.inner.connector_added(
+                        new_device.drm.device_mut(),
+                        backend.primary_node.clone(),
+                        conn,
+                        maybe_crtc,
+                        (w, 0),
+                        &self.common.event_loop_handle,
+                        self.common.config.dynamic_conf.screen_filter().clone(),
+                        self.common.shell.clone(),
+                        self.common.startup_done.clone(),
+                    ) {
+                        Ok((output, should_expose)) => {
+                            if should_expose {
+                                w += output.geometry().size.w as u32;
+                                outputs_added.push(output.clone());
                             }
-                            Err(err) => {
-                                warn!(?err, "Failed to initialize output, skipping");
-                            }
+
+                            new_device.inner.outputs.insert(conn, output);
+                        }
+                        Err(err) => {
+                            warn!(?err, "Failed to initialize output, skipping");
                         }
                     }
                 }
@@ -823,6 +858,8 @@ impl Device {
 
                 outputs: HashMap::new(),
                 surfaces: HashMap::new(),
+                tile_outputs: HashMap::new(),
+                tile_pending: HashMap::new(),
                 gbm,
 
                 leased_connectors: Vec::new(),
@@ -1080,52 +1117,160 @@ impl InnerDevice {
                 );
             }
 
-            Ok((output, false))
-        } else {
-            let new_config = output
-                .user_data()
-                .insert_if_missing(|| RefCell::new(OutputConfig::default()));
+            return Ok((output, false));
+        }
 
-            populate_modes(drm, &output, conn, new_config, position)
-                .with_context(|| "Failed to enumerate connector modes")?;
+        // Resolve tile membership: any connector carrying a `TILE` blob is
+        // merged into the shared logical Output for its group.
+        let tile_info = drm.tile_info(conn).ok().flatten();
 
-            let has_surface = if let Some(crtc) = maybe_crtc {
-                match Surface::new(
-                    &output,
-                    crtc,
-                    conn,
-                    primary_node,
-                    self.dev_node,
-                    self.render_node,
-                    evlh,
-                    screen_filter,
-                    shell,
-                    startup_done,
-                ) {
-                    Ok(data) => {
-                        self.surfaces.insert(crtc, data);
-                        true
-                    }
-                    Err(err) => {
-                        error!(?crtc, "Failed to initialize surface: {}", err);
-                        false
-                    }
-                }
+        if let Some(info) = tile_info.as_ref() {
+            // Merged tile group: the whole group is driven by ONE Surface built
+            // via `initialize_tiled_output` (smithay's `new_tiled` does the
+            // slicing). Build/fetch the merged logical Output, gather this
+            // member, and create the surface once the group is complete.
+            let first_arrival = !self.tile_outputs.contains_key(&info.group_id);
+            let merged = if let Some(existing) = self.tile_outputs.get(&info.group_id).cloned() {
+                existing
             } else {
-                false
-            };
-
-            if !has_surface {
-                output
+                // First arrival of this group: build the merged Output now,
+                // sized to the full tile grid.
+                let merged = create_merged_output_for_tile(drm, conn, info, position)?;
+                // Seed the merged Output's OutputConfig with the logical
+                // mode + position + tile-native refresh. Several downstream
+                // paths (notably the mode-match in apply_config_for_outputs)
+                // call `.unwrap()` on the saved refresh, so leaving the
+                // default `mode: ((0,0), None)` here panics on first reapply.
+                let _ = merged
+                    .user_data()
+                    .insert_if_missing(|| RefCell::new(OutputConfig::default()));
+                let logical_mode = merged
+                    .current_mode()
+                    .expect("merged Output was just initialized with a mode");
+                let refresh_mhz = logical_mode.refresh as u32;
+                let mut output_config = merged
                     .user_data()
                     .get::<RefCell<OutputConfig>>()
                     .unwrap()
-                    .borrow_mut()
-                    .enabled = OutputState::Disabled;
+                    .borrow_mut();
+                *output_config = OutputConfig {
+                    mode: (
+                        (logical_mode.size.w, logical_mode.size.h),
+                        Some(refresh_mhz),
+                    ),
+                    position,
+                    // `create_merged_output_for_tile` already derived the scale
+                    // from the logical density; reuse it rather than recompute.
+                    scale: merged.current_scale().fractional_scale(),
+                    transform: CompTransformDef::from(Transform::Normal).0,
+                    vrr: AdaptiveSync::Disabled,
+                    ..std::mem::take(&mut *output_config)
+                };
+                drop(output_config);
+                self.tile_outputs.insert(info.group_id, merged.clone());
+                merged
+            };
+
+            // A tile without a CRTC can't be driven; expose the Output but add
+            // no surface for it.
+            let Some(crtc) = maybe_crtc else {
+                return Ok((merged, first_arrival));
+            };
+
+            // Gather this member and wait until the whole group has arrived.
+            let slots = self.tile_pending.entry(info.group_id).or_default();
+            slots.retain(|s| s.crtc != crtc && s.connector != conn);
+            slots.push(TileSlot::from_tile_info(crtc, conn, info));
+            if slots.len() < TileSlot::expected_count(info) {
+                return Ok((merged, first_arrival));
             }
 
-            Ok((output, true))
+            // Group complete: build the single tiled surface. It is keyed by,
+            // and renders through, the primary (0,0) tile's CRTC; the other
+            // member CRTCs are driven by its `new_tiled` compositor. The surface
+            // renders the merged Output as a whole (no per-tile slicing in
+            // cosmic-comp).
+            let mut slots = self
+                .tile_pending
+                .remove(&info.group_id)
+                .expect("group was just populated via entry().or_default()");
+            slots.sort_by_key(|slot| !slot.primary); // primary first (== tiles[0])
+            let primary = slots[0].clone();
+            match Surface::new(
+                &merged,
+                primary.crtc,
+                primary.connector,
+                Some(slots),
+                primary_node,
+                self.dev_node,
+                self.render_node,
+                evlh,
+                screen_filter,
+                shell,
+                startup_done,
+            ) {
+                Ok(data) => {
+                    self.surfaces.insert(primary.crtc, data);
+                }
+                Err(err) => {
+                    error!(crtc = ?primary.crtc, "Failed to initialize tiled surface: {}", err);
+                    if first_arrival {
+                        merged
+                            .user_data()
+                            .get::<RefCell<OutputConfig>>()
+                            .unwrap()
+                            .borrow_mut()
+                            .enabled = OutputState::Disabled;
+                    }
+                }
+            }
+            return Ok((merged, first_arrival));
         }
+
+        // Ordinary (non-tiled) connector: one Surface per CRTC.
+        let new_config = output
+            .user_data()
+            .insert_if_missing(|| RefCell::new(OutputConfig::default()));
+        populate_modes(drm, &output, conn, new_config, position)
+            .with_context(|| "Failed to enumerate connector modes")?;
+
+        let has_surface = if let Some(crtc) = maybe_crtc {
+            match Surface::new(
+                &output,
+                crtc,
+                conn,
+                None,
+                primary_node,
+                self.dev_node,
+                self.render_node,
+                evlh,
+                screen_filter,
+                shell,
+                startup_done,
+            ) {
+                Ok(data) => {
+                    self.surfaces.insert(crtc, data);
+                    true
+                }
+                Err(err) => {
+                    error!(?crtc, "Failed to initialize surface: {}", err);
+                    false
+                }
+            }
+        } else {
+            false
+        };
+
+        if !has_surface {
+            output
+                .user_data()
+                .get::<RefCell<OutputConfig>>()
+                .unwrap()
+                .borrow_mut()
+                .enabled = OutputState::Disabled;
+        }
+
+        Ok((output, true))
     }
 
     pub fn update_egl(
@@ -1219,6 +1364,99 @@ impl InnerDevice {
     }
 }
 
+/// Create a fresh [`Output`] sized for an entire merged tile group, named
+/// stably by `group_id` so its config persists across connector reorderings.
+///
+/// Mirrors the per-connector setup in [`create_output_for_conn`] but uses
+/// the logical `(sum tile_w, max tile_h)` size and registers a single
+/// logical-resolution [`OutputMode`] derived from the tile's native refresh.
+fn create_merged_output_for_tile(
+    drm: &mut DrmDevice,
+    conn: connector::Handle,
+    info: &TileInfo,
+    position: (u32, u32),
+) -> Result<Output> {
+    let conn_info = drm
+        .get_connector(conn, false)
+        .with_context(|| "Failed to query connector info for tile-merge Output")?;
+    let edid_info = drm_helpers::edid_info(drm, conn).ok();
+
+    // Aggregate physical dimensions across the grid; the kernel reports
+    // per-tile mm sizes on each connector.
+    let (per_tile_mm_w, per_tile_mm_h) = conn_info.size().unwrap_or((0, 0));
+    let phys_w = per_tile_mm_w.saturating_mul(u32::from(info.num_h_tiles));
+    let phys_h = per_tile_mm_h.saturating_mul(u32::from(info.num_v_tiles));
+
+    let output = Output::new(
+        format!("tile-group-{}", info.group_id),
+        PhysicalProperties {
+            size: (phys_w as i32, phys_h as i32).into(),
+            subpixel: match conn_info.subpixel() {
+                connector::SubPixel::HorizontalRgb => Subpixel::HorizontalRgb,
+                connector::SubPixel::HorizontalBgr => Subpixel::HorizontalBgr,
+                connector::SubPixel::VerticalRgb => Subpixel::VerticalRgb,
+                connector::SubPixel::VerticalBgr => Subpixel::VerticalBgr,
+                connector::SubPixel::None => Subpixel::None,
+                _ => Subpixel::Unknown,
+            },
+            make: edid_info
+                .as_ref()
+                .and_then(|i| i.make())
+                .unwrap_or_else(|| String::from("Unknown")),
+            model: edid_info
+                .as_ref()
+                .and_then(|i| i.model())
+                .unwrap_or_else(|| String::from("Unknown")),
+            serial_number: edid_info
+                .as_ref()
+                .and_then(|i| i.serial())
+                .unwrap_or_else(|| String::from("Unknown")),
+        },
+    );
+    if let Some(edid) = edid_info.as_ref().and_then(|x| x.edid()) {
+        output
+            .user_data()
+            .insert_if_missing(|| EdidProduct::from(edid.vendor_product()));
+    }
+
+    // Pick the tile's native mode (matches Step 2a) to derive the refresh
+    // rate for the merged logical mode.
+    let tile_size_px = (info.tile_w, info.tile_h);
+    let refresh_mhz = conn_info
+        .modes()
+        .iter()
+        .filter(|m| m.size() == tile_size_px)
+        .map(|m| drm_helpers::calculate_refresh_rate(*m))
+        .max()
+        .unwrap_or(60_000) as i32;
+
+    let logical_w = i32::from(info.tile_w) * i32::from(info.num_h_tiles);
+    let logical_h = i32::from(info.tile_h) * i32::from(info.num_v_tiles);
+    let logical_mode = OutputMode {
+        size: (logical_w, logical_h).into(),
+        refresh: refresh_mhz,
+    };
+    // Default scale from the logical monitor's density, same heuristic as the
+    // per-connector path. `calculate_scale` returns its fallback when the
+    // physical size is unknown (`phys_* == 0`).
+    let scale = calculate_scale(
+        conn_info.interface(),
+        (phys_w, phys_h),
+        (logical_w as u16, logical_h as u16),
+    );
+
+    output.add_mode(logical_mode);
+    output.set_preferred(logical_mode);
+    output.change_current_state(
+        Some(logical_mode),
+        Some(Transform::Normal),
+        Some(Scale::Fractional(scale)),
+        Some(Point::from((position.0 as i32, position.1 as i32))),
+    );
+
+    Ok(output)
+}
+
 fn create_output_for_conn(drm: &mut DrmDevice, conn: connector::Handle) -> Result<Output> {
     let conn_info = drm
         .get_connector(conn, false)
@@ -1272,11 +1510,31 @@ fn populate_modes(
 ) -> Result<()> {
     let conn_info = drm.get_connector(conn, false)?;
     let max_bpc = drm_helpers::get_max_bpc(drm, conn)?.map(|(_val, range)| range.end.min(16));
-    let Some(mode) = conn_info
-        .modes()
-        .iter()
-        .find(|mode| mode.mode_type().contains(ModeTypeFlags::PREFERRED))
-        .copied()
+
+    // For DisplayID-tiled connectors (LG UltraFine 5K and similar), the
+    // kernel's PREFERRED bit can land on a single-cable fallback mode whose
+    // dimensions don't match the per-tile native size — e.g. on the LG
+    // UltraFine 5K, DP-3 falls back to 4096x2304 while DP-4 holds at
+    // 2560x2880, leaving the two tiles unable to render a single image.
+    // When tile info is available, prefer a mode whose dimensions equal
+    // (tile_w, tile_h); among those, prefer the highest refresh.
+    let tile_info = drm.tile_info(conn).ok().flatten();
+    let tile_match = tile_info.and_then(|tile| {
+        conn_info
+            .modes()
+            .iter()
+            .filter(|m| m.size() == (tile.tile_w, tile.tile_h))
+            .max_by_key(|m| drm_helpers::calculate_refresh_rate(**m))
+            .copied()
+    });
+    let Some(mode) = tile_match
+        .or_else(|| {
+            conn_info
+                .modes()
+                .iter()
+                .find(|mode| mode.mode_type().contains(ModeTypeFlags::PREFERRED))
+                .copied()
+        })
         .or(conn_info.modes().first().copied())
     else {
         anyhow::bail!("No mode found");
